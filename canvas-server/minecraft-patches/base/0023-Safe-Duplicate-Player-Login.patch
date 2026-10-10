@@ -1,0 +1,158 @@
+From e313c0c4a051bbdcaf809370172ae82456a90bd1 Mon Sep 17 00:00:00 2001
+From: Canvas Fix <canvasfix@local.invalid>
+Date: Sat, 10 Oct 2026 15:43:07 +0000
+Subject: [PATCH] Prevent unsafe duplicate UUID player placement on Folia
+
+---
+ net/minecraft/server/level/ServerLevel.java   | 21 ++++++++++-----
+ ...ServerConfigurationPacketListenerImpl.java | 27 ++++++++++++++++---
+ net/minecraft/server/players/PlayerList.java  | 27 +++++++++++++++++++
+ 3 files changed, 65 insertions(+), 10 deletions(-)
+
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 3a79589..f34825c 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1735,15 +1735,22 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         this.addPlayer(player);
+     }
+ 
+-    private void addPlayer(ServerPlayer player) {
+-        Entity entity = this.getEntity(player.getUUID());
+-        if (entity != null) {
+-            LOGGER.warn("Force-added player with duplicate UUID {}", player.getUUID());
+-            entity.unRide();
+-            this.removePlayerImmediately((ServerPlayer)entity, Entity.RemovalReason.DISCARDED);
++    public static final class DuplicatePlayerSpawnException extends IllegalStateException {
++        public DuplicatePlayerSpawnException(ServerPlayer player, Entity existing) {
++            super("Player " + player.getGameProfile().name() + " (" + player.getUUID() + ") conflicts with entity " + existing.getId());
+         }
++    }
+ 
+-        this.moonrise$getEntityLookup().addNewEntity(player); // Paper - rewrite chunk system
++    private void addPlayer(ServerPlayer player) {
++        Entity existing = this.getEntity(player.getUUID());
++        if (existing == player) return;
++        if (existing != null) {
++            LOGGER.warn("Rejected duplicate player UUID {}: existing entity {} is still registered", player.getUUID(), existing.getId());
++            throw new DuplicatePlayerSpawnException(player, existing);
++        }
++        if (!this.moonrise$getEntityLookup().addNewEntity(player)) {
++            throw new IllegalStateException("Unable to register player " + player.getUUID() + " in entity lookup");
++        }
+     }
+ 
+     // CraftBukkit start
+diff --git a/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java b/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
+index 794425b..63f938c 100644
+--- a/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
+@@ -81,6 +81,7 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+ 
+     @Override
+     public void onDisconnect(DisconnectionDetails details) {
++        this.server.getPlayerList().canvas$releasePlayerPlacement(this.gameProfile.id(), this.connection);
+         // Paper start - Debugging
+         if (this.server.isDebugging()) {
+             ServerConfigurationPacketListenerImpl.LOGGER.info("{} ({}) lost connection: {}, while in configuration phase {}", this.gameProfile.name(), this.gameProfile.id(), details.reason().getString(), this.currentTask != null ? this.currentTask.type().id() : "null");
+@@ -236,6 +237,11 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+                 return;
+             }
+ 
++            if (!playerList.canvas$acquirePlayerPlacement(this.gameProfile.id(), this.connection)) {
++                this.disconnect(PlayerList.DUPLICATE_LOGIN_DISCONNECT_MESSAGE);
++                return;
++            }
++
+             // Folia start - region threading
+             final Connection connection = this.connection;
+             final CommonListenerCookie commonListenerCookie = this.createCookie(this.clientInformation);
+@@ -256,15 +262,30 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+                         );
+                         io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
+                                 world, chunkPos.x, chunkPos.z, () -> {
+-                                    net.minecraft.server.network.ServerConfigurationPacketListenerImpl.this.prepareSpawnTask.spawnPlayer(
+-                                            this.connection, commonListenerCookie, serverPlayer
+-                                    );
++                                    try {
++                                        final PrepareSpawnTask spawnTask = this.prepareSpawnTask;
++                                        if (!connection.isConnected() || spawnTask == null) return;
++                                        if (!playerList.canvas$canPlacePlayer(serverPlayer)) {
++                                            connection.disconnectSafely(PlayerList.DUPLICATE_LOGIN_DISCONNECT_MESSAGE, io.papermc.paper.connection.DisconnectionReason.DUPLICATE_LOGIN_MESSAGE);
++                                            return;
++                                        }
++                                        spawnTask.spawnPlayer(connection, commonListenerCookie, serverPlayer);
++                                    } catch (PlayerList.DuplicatePlayerLoginException | net.minecraft.server.level.ServerLevel.DuplicatePlayerSpawnException exception) {
++                                        LOGGER.warn("Duplicate player UUID rejected during region spawn: {}", this.gameProfile.id());
++                                        connection.disconnectSafely(PlayerList.DUPLICATE_LOGIN_DISCONNECT_MESSAGE, io.papermc.paper.connection.DisconnectionReason.DUPLICATE_LOGIN_MESSAGE);
++                                    } catch (Exception exception) {
++                                        LOGGER.error("Couldn't place player in world", exception);
++                                        connection.disconnectSafely(DISCONNECT_REASON_INVALID_DATA, io.papermc.paper.connection.DisconnectionReason.UNKNOWN);
++                                    } finally {
++                                        playerList.canvas$releasePlayerPlacement(this.gameProfile.id(), connection);
++                                    }
+                                 }
+                         );
+                     }
+             );
+             // Folia end - region threading - rewrite login process
+         } catch (Exception var4) {
++            this.server.getPlayerList().canvas$releasePlayerPlacement(this.gameProfile.id(), this.connection);
+             LOGGER.error("Couldn't place player in world", (Throwable)var4);
+             this.disconnect(DISCONNECT_REASON_INVALID_DATA);
+         }
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 2fbce07..d1c8523 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -116,6 +116,7 @@ public abstract class PlayerList {
+     private final MinecraftServer server;
+     public final List<ServerPlayer> players = new java.util.concurrent.CopyOnWriteArrayList(); // CraftBukkit - ArrayList -> CopyOnWriteArrayList: Iterator safety
+     private final Map<UUID, ServerPlayer> playersByUUID = new java.util.concurrent.ConcurrentHashMap<>(); // Folia - region threading - change to CHM - Note: we do NOT expect concurrency PER KEY!
++    private final java.util.concurrent.ConcurrentHashMap<UUID, Connection> canvas$pendingPlayerPlacements = new java.util.concurrent.ConcurrentHashMap<>();
+     private final UserBanList bans;
+     private final IpBanList ipBans;
+     private final ServerOpList ops;
+@@ -202,6 +203,29 @@ public abstract class PlayerList {
+     }
+     // Folia end - region threading
+ 
++    public static final class DuplicatePlayerLoginException extends IllegalStateException {
++        public DuplicatePlayerLoginException(UUID uuid) {
++            super("Player " + uuid + " is still registered or being placed in a world");
++        }
++    }
++
++    public boolean canvas$acquirePlayerPlacement(UUID uuid, Connection connection) {
++        return this.canvas$pendingPlayerPlacements.putIfAbsent(uuid, connection) == null;
++    }
++
++    public void canvas$releasePlayerPlacement(UUID uuid, Connection connection) {
++        this.canvas$pendingPlayerPlacements.remove(uuid, connection);
++    }
++
++    public boolean canvas$canPlacePlayer(ServerPlayer player) {
++        if (this.playersByUUID.containsKey(player.getUUID())) return false;
++        for (ServerLevel level : this.server.getAllLevels()) {
++            Entity existing = level.getEntity(player.getUUID());
++            if (existing != null && existing != player) return false;
++        }
++        return true;
++    }
++
+     public PlayerList(
+         MinecraftServer server, LayeredRegistryAccess<RegistryLayer> registries, PlayerDataStorage playerIo, NotificationService notificationService
+     ) {
+@@ -220,6 +244,9 @@ public abstract class PlayerList {
+     abstract public void loadAndSaveFiles(); // Paper - fix converting txt to json file; moved from DedicatedPlayerList constructor
+ 
+     public void placeNewPlayer(Connection connection, ServerPlayer player, CommonListenerCookie cookie) {
++        if (!connection.isConnected() || !this.canvas$canPlacePlayer(player)) {
++            throw new DuplicatePlayerLoginException(player.getUUID());
++        }
+         player.isRealPlayer = true; // Paper
+         player.loginTime = System.currentTimeMillis(); // Paper - Replace OfflinePlayer#getLastPlayed
+         NameAndId nameAndId = player.nameAndId();
+-- 
+2.47.3
+
